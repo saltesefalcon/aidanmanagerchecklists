@@ -1,18 +1,40 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import SessionGate from '@/components/SessionGate';
 import SignOutButton from '@/components/SignOutButton';
 import {
-  collection, getDocs, doc, onSnapshot, setDoc, updateDoc,
+  collection,
+  getDocs,
+  doc,
+  onSnapshot,
+  setDoc,
+  writeBatch,
+  serverTimestamp,
+  deleteDoc,
 } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
+import Link from 'next/link';
+import { getBusinessDate } from '@/lib/bizdate';
 
-type DutyTemplates = { open: string[]; mid: string[]; close: string[]; };
 type Shift = 'open' | 'mid' | 'close';
 type Restaurant = { id: string; name: string };
+type DutyItem = { title: string; priority?: boolean };
+type DutyTemplates = { open: DutyItem[]; mid: DutyItem[]; close: DutyItem[] };
 
 const EMPTY: DutyTemplates = { open: [], mid: [], close: [] };
+
+function normalizeTemplates(raw: any): DutyTemplates {
+  const coerce = (arr: any): DutyItem[] =>
+    Array.isArray(arr)
+      ? arr.map((x: any) =>
+          typeof x === 'string'
+            ? { title: x, priority: false }
+            : { title: x?.title ?? '', priority: !!x?.priority }
+        )
+      : [];
+  return { open: coerce(raw?.open), mid: coerce(raw?.mid), close: coerce(raw?.close) };
+}
 
 export default function SettingsPage() {
   const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
@@ -22,72 +44,118 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [newDuty, setNewDuty] = useState('');
   const [bulkText, setBulkText] = useState('');
+  const [saveHint, setSaveHint] = useState<'saved' | 'dirty' | 'idle'>('idle');
+  const [resetDate, setResetDate] = useState(getBusinessDate());
 
-  // Load restaurant list
   useEffect(() => {
     (async () => {
       const snap = await getDocs(collection(db, 'restaurants'));
-      const list = snap.docs.map(d => ({ id: d.id, name: (d.data().name as string) ?? d.id }));
+      const list = snap.docs.map((d) => ({ id: d.id, name: (d.data().name as string) ?? d.id }));
       setRestaurants(list);
       if (!restId && list.length) setRestId(list[0].id);
     })();
-  }, []); // eslint-disable-line
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Live subscribe to settings/config for selected restaurant
   useEffect(() => {
     if (!restId) return;
     setLoading(true);
     const ref = doc(db, 'restaurants', restId, 'settings', 'config');
     const unsub = onSnapshot(ref, (snap) => {
       const data = snap.data() as any;
-      const dt: DutyTemplates = data?.dutyTemplates ?? EMPTY;
-      // normalize to arrays
-      setTemplates({
-        open: Array.isArray(dt.open) ? dt.open : [],
-        mid: Array.isArray(dt.mid) ? dt.mid : [],
-        close: Array.isArray(dt.close) ? dt.close : [],
-      });
+      setTemplates(normalizeTemplates(data?.dutyTemplates ?? EMPTY));
       setLoading(false);
+      setSaveHint('idle');
     });
     return () => unsub();
   }, [restId]);
 
-  const saveTemplates = async (next: DutyTemplates) => {
+  const persist = async (next?: DutyTemplates) => {
+    const payload = next ?? templates;
     const ref = doc(db, 'restaurants', restId, 'settings', 'config');
-    await setDoc(ref, { dutyTemplates: next }, { merge: true });
+    await setDoc(ref, { dutyTemplates: payload }, { merge: true });
+    setSaveHint('saved');
+    setTimeout(() => setSaveHint('idle'), 1500);
   };
 
-  const addDuty = async () => {
+  // local edit helpers (mark form "dirty" until saved)
+  const setListLocal = (u: (list: DutyItem[]) => DutyItem[]) => {
+    const list = u(templates[shift]);
+    const next = { ...templates, [shift]: list };
+    setTemplates(next);
+    setSaveHint('dirty');
+  };
+
+  const addDuty = () => {
     const title = newDuty.trim();
     if (!title) return;
-    const next = { ...templates, [shift]: [...templates[shift], title] };
-    setTemplates(next);
+    setListLocal((list) => [...list, { title, priority: false }]);
     setNewDuty('');
-    await saveTemplates(next);
+  };
+  const removeDuty = (idx: number) =>
+    setListLocal((list) => {
+      const copy = [...list];
+      copy.splice(idx, 1);
+      return copy;
+    });
+  const updateTitle = (idx: number, text: string) =>
+    setListLocal((list) => {
+      const copy = [...list];
+      copy[idx] = { ...copy[idx], title: text };
+      return copy;
+    });
+  const togglePriority = (idx: number, v: boolean) =>
+    setListLocal((list) => {
+      const copy = [...list];
+      copy[idx] = { ...copy[idx], priority: v };
+      return copy;
+    });
+  const moveUp = (idx: number) =>
+    setListLocal((list) => {
+      if (idx === 0) return list;
+      const copy = [...list];
+      [copy[idx - 1], copy[idx]] = [copy[idx], copy[idx - 1]];
+      return copy;
+    });
+  const moveDown = (idx: number) =>
+    setListLocal((list) => {
+      if (idx === list.length - 1) return list;
+      const copy = [...list];
+      [copy[idx + 1], copy[idx]] = [copy[idx], copy[idx + 1]];
+      return copy;
+    });
+
+  const replaceFromBulk = () => {
+    const lines = bulkText.split('\n').map((l) => l.trim()).filter(Boolean);
+    setTemplates({ ...templates, [shift]: lines.map((t) => ({ title: t, priority: false })) });
+    setSaveHint('dirty');
   };
 
-  const replaceFromBulk = async () => {
-    // one duty per line; ignore blanks
-    const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean);
-    const next = { ...templates, [shift]: lines };
-    setTemplates(next);
-    await saveTemplates(next);
-  };
+  // Reset a specific date from current template (clears duplicates, applies order/priority)
+  const resetDayFromTemplate = async () => {
+    if (!restId || !resetDate) return;
+    if (!confirm(`Reset ${restId} ${resetDate} ${shift.toUpperCase()} from template? This will DELETE existing items for that shift/date and reseed.`)) return;
 
-  const removeDuty = async (idx: number) => {
-    const list = [...templates[shift]];
-    list.splice(idx, 1);
-    const next = { ...templates, [shift]: list };
-    setTemplates(next);
-    await saveTemplates(next);
-  };
+    // 1) wipe items
+    const itemsCol = collection(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift, 'items');
+    const snap = await getDocs(itemsCol);
+    const batch = writeBatch(db);
+    snap.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
 
-  const updateDuty = async (idx: number, text: string) => {
-    const list = [...templates[shift]];
-    list[idx] = text;
-    const next = { ...templates, [shift]: list };
-    setTemplates(next);
-    await saveTemplates(next);
+    // 2) ensure shift doc unlocked
+    const sref = doc(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift);
+    await setDoc(sref, { locked: false, createdAt: serverTimestamp() }, { merge: true });
+
+    // 3) reseed from current template with order/priority
+    const batch2 = writeBatch(db);
+    templates[shift].forEach((d, idx) => {
+      const r = doc(itemsCol);
+      batch2.set(r, { title: d.title, priority: !!d.priority, order: idx, checked: false });
+    });
+    await batch2.commit();
+
+    alert('Checklist reset and reseeded from template.');
   };
 
   const duties = templates[shift];
@@ -96,47 +164,54 @@ export default function SettingsPage() {
     <SessionGate requireAdmin>
       <main className="p-6 max-w-4xl mx-auto space-y-6">
         <header className="flex items-center justify-between">
-          <h1 className="text-2xl font-semibold">Admin Settings</h1>
+          <div className="flex items-center gap-3">
+            <Link href="/" className="inline-flex items-center px-3 py-2 rounded border hover:bg-slate-50">← Home</Link>
+            <h1 className="text-2xl font-semibold">Admin Settings</h1>
+          </div>
           <SignOutButton />
         </header>
 
-        {/* Restaurant picker */}
-        <section className="grid gap-3 grid-cols-1 sm:grid-cols-2">
+        {/* pickers */}
+        <section className="grid gap-3 grid-cols-1 sm:grid-cols-3">
           <label>
             <span className="text-sm">Restaurant</span>
-            <select
-              className="mt-1 w-full border rounded px-3 py-2"
-              value={restId}
-              onChange={(e) => setRestId(e.target.value)}
-            >
-              {restaurants.map(r => (
-                <option key={r.id} value={r.id}>{r.name}</option>
-              ))}
+            <select className="mt-1 w-full border rounded px-3 py-2" value={restId} onChange={(e) => setRestId(e.target.value)}>
+              {restaurants.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
             </select>
           </label>
-
-          {/* Shift tabs */}
-          <div className="space-y-1">
+          <div className="space-y-1 sm:col-span-2">
             <span className="text-sm">Shift</span>
             <div className="mt-1 grid grid-cols-3 gap-2">
-              {(['open','mid','close'] as Shift[]).map(s => (
-                <button
-                  key={s}
-                  onClick={() => setShift(s)}
-                  className={`py-2 rounded border ${shift === s ? 'bg-slate-800 text-white' : ''}`}
-                >
-                  {s.toUpperCase()}
-                </button>
+              {(['open','mid','close'] as Shift[]).map((s) => (
+                <button key={s} onClick={() => setShift(s)}
+                  className={`py-2 rounded border ${shift===s ? 'bg-slate-800 text-white':''}`}>{s.toUpperCase()}</button>
               ))}
             </div>
           </div>
         </section>
 
-        {/* Duties editor */}
+        {/* editor */}
         <section className="rounded-xl border p-4">
-          <div className="mb-3">
-            <h2 className="text-lg font-medium">Duties for {shift.toUpperCase()}</h2>
-            <p className="text-sm text-slate-600">Add, edit, or remove duties. Changes save immediately.</p>
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="text-lg font-medium">Duties for {shift.toUpperCase()}</h2>
+              <p className="text-sm text-slate-600">
+                Edit, mark <span className="font-medium">Priority</span>, and reorder with ↑/↓.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => persist()}
+                className="px-3 py-2 rounded bg-slate-800 text-white"
+                title="Save changes"
+              >
+                Save changes
+              </button>
+              <span className="text-sm text-slate-600">
+                {saveHint === 'dirty' && 'Unsaved changes'}
+                {saveHint === 'saved' && 'Saved'}
+              </span>
+            </div>
           </div>
 
           {loading ? (
@@ -147,16 +222,18 @@ export default function SettingsPage() {
                 <div key={i} className="flex items-center gap-2">
                   <input
                     className="flex-1 border rounded px-3 py-2"
-                    value={duty}
-                    onChange={(e) => updateDuty(i, e.target.value)}
+                    value={duty.title}
+                    onChange={(e) => updateTitle(i, e.target.value)}
                   />
-                  <button
-                    className="px-3 py-2 rounded border"
-                    onClick={() => removeDuty(i)}
-                    title="Remove"
-                  >
-                    ✕
-                  </button>
+                  <label className="text-sm flex items-center gap-1 px-2 select-none">
+                    <input type="checkbox" checked={!!duty.priority} onChange={(e) => togglePriority(i, e.target.checked)} />
+                    Priority
+                  </label>
+                  <div className="flex items-center gap-1">
+                    <button className="px-2 py-2 rounded border" disabled={i===0} onClick={() => moveUp(i)} title="Move up">↑</button>
+                    <button className="px-2 py-2 rounded border" disabled={i===duties.length-1} onClick={() => moveDown(i)} title="Move down">↓</button>
+                    <button className="px-3 py-2 rounded border" onClick={() => removeDuty(i)} title="Remove">✕</button>
+                  </div>
                 </div>
               ))}
 
@@ -167,15 +244,11 @@ export default function SettingsPage() {
                   value={newDuty}
                   onChange={(e) => setNewDuty(e.target.value)}
                 />
-                <button className="px-4 py-2 rounded bg-slate-800 text-white" onClick={addDuty}>
-                  Add
-                </button>
+                <button className="px-4 py-2 rounded bg-slate-800 text-white" onClick={addDuty}>Add</button>
               </div>
 
               <div className="pt-4">
-                <label className="block text-sm mb-1">
-                  Bulk replace (one duty per line)
-                </label>
+                <label className="block text-sm mb-1">Bulk replace (one duty per line)</label>
                 <textarea
                   className="w-full min-h-[120px] border rounded p-3"
                   placeholder={`e.g.\nCount cash drawer\nSweep front entry\n…`}
@@ -190,6 +263,24 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
+        </section>
+
+        {/* Reset from template */}
+        <section className="rounded-xl border p-4">
+          <h3 className="text-lg font-medium mb-2">Reset a day from current template</h3>
+          <p className="text-sm text-slate-600">
+            Deletes existing items for the selected <b>{shift.toUpperCase()}</b> and reseeds in the new order/priority.
+          </p>
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <label className="text-sm">
+              Date&nbsp;
+              <input type="date" value={resetDate} onChange={(e) => setResetDate(e.target.value)}
+                     className="border rounded px-2 py-1" />
+            </label>
+            <button onClick={resetDayFromTemplate} className="px-3 py-2 rounded border">
+              Reset from template
+            </button>
+          </div>
         </section>
       </main>
     </SessionGate>
