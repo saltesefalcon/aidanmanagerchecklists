@@ -7,6 +7,7 @@ import {
   collection,
   getDocs,
   doc,
+  getDoc,
   onSnapshot,
   setDoc,
   writeBatch,
@@ -137,28 +138,35 @@ const resetDayFromTemplate = async () => {
   if (!restId || !resetDate) return;
   if (!confirm(`Reset ${restId} ${resetDate} ${shift.toUpperCase()} from template? This REPLACES items.`)) return;
 
-  // Ensure day doc exists (optional TTL on day docs if you later add a TTL policy)
   const dayRef = doc(db, 'restaurants', restId, 'checklists', resetDate);
   await setDoc(dayRef, { date: resetDate, expireAt: expiryFor(resetDate) }, { merge: true });
 
-  // Wipe existing items
+  const shiftRef = doc(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift);
+  await setDoc(shiftRef, { locked: false, createdAt: serverTimestamp(), expireAt: expiryFor(resetDate) }, { merge: true });
+
+  // clear items
   const itemsCol = collection(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift, 'items');
-  const snap = await getDocs(itemsCol);
-  const b1 = writeBatch(db);
-  snap.forEach(d => b1.delete(d.ref));
-  await b1.commit();
+  const cur = await getDocs(itemsCol);
+  if (!cur.empty) {
+    const bDel = writeBatch(db);
+    cur.forEach(d => bDel.delete(d.ref));
+    await bDel.commit();
+  }
 
-  // Recreate shift (unlocked) and stamp expireAt
-  const sref = doc(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift);
-  await setDoc(sref, { locked: false, createdAt: serverTimestamp(), expireAt: expiryFor(resetDate) }, { merge: true });
+  // read current template and seed with order/priority + expireAt
+  const cfgRef = doc(db, 'restaurants', restId, 'settings', 'config');
+  const cfgSnap = await getDoc(cfgRef);
+  const dutyTemplates = (cfgSnap.data()?.dutyTemplates || {}) as Record<Shift, any[]>;
+  const duties = Array.isArray(dutyTemplates[shift]) ? dutyTemplates[shift] : [];
 
-  // Seed items with order/priority + expireAt
-  const b2 = writeBatch(db);
-  templates[shift].forEach((d, idx) => {
+  const b = writeBatch(db);
+  duties.forEach((d, idx) => {
     const r = doc(itemsCol);
-    b2.set(r, { title: d.title, priority: !!d.priority, order: idx, checked: false, expireAt: expiryFor(resetDate) });
+    const title = typeof d === 'string' ? d : (d?.title ?? '');
+    const priority = typeof d === 'object' ? !!d?.priority : false;
+    b.set(r, { title, priority, order: idx, checked: false, expireAt: expiryFor(resetDate) });
   });
-  await b2.commit();
+  await b.commit();
 
   alert('Checklist reseeded from template (with 400-day auto-expiry).');
 };
