@@ -21,6 +21,7 @@ import {
 } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { auth, db } from '@/lib/firebase';
+import { expiryFor } from '@/lib/expiry';
 
 type Shift = 'open' | 'mid' | 'close';
 type Item = {
@@ -123,31 +124,40 @@ export default function ShiftChecklistPage() {
   }, [itemsCol]);
 
   // reseed helper (admin-only by UI; rules enforce admin for deletes)
-  const reseedFromTemplate = async () => {
-    // wipe
-    const snap = await getDocs(itemsCol);
-    if (!snap.empty) {
-      const b1 = writeBatch(db);
-      snap.forEach((d) => b1.delete(d.ref));
-      await b1.commit();
-    }
+const reseedFromTemplate = async () => {
+  // Optional: only admins stamp the day doc; managers may not have write to /checklists/{date}
+  if (me?.isAdmin) {
+    const dayRef = doc(db, 'restaurants', restId, 'checklists', date);
+    await setDoc(dayRef, { date, expireAt: expiryFor(date) }, { merge: true });
+  }
 
-    // read current template
-    const cfgRef = doc(db, 'restaurants', restId, 'settings', 'config');
-    const cfgSnap = await getDoc(cfgRef);
-    const dutyTemplates = (cfgSnap.data()?.dutyTemplates || {}) as Record<Shift, any[]>;
-    const duties = Array.isArray(dutyTemplates[shift]) ? dutyTemplates[shift] : [];
+  // Clear existing items
+  const existing = await getDocs(itemsCol);
+  if (!existing.empty) {
+    const bDel = writeBatch(db);
+    existing.forEach((d) => bDel.delete(d.ref));
+    await bDel.commit();
+  }
 
-    // write in order/priority
-    const b2 = writeBatch(db);
-    duties.forEach((d, idx) => {
-      const r = doc(itemsCol);
-      const title = typeof d === 'string' ? d : (d?.title ?? '');
-      const priority = typeof d === 'object' ? !!d?.priority : false;
-      b2.set(r, { title, priority, order: idx, checked: false });
-    });
-    await b2.commit();
-  };
+  // Ensure shift (unlocked) with expireAt
+  await setDoc(shiftRef, { locked: false, createdAt: serverTimestamp(), expireAt: expiryFor(date) }, { merge: true });
+
+  // Read current template and seed with expireAt
+  const cfgRef = doc(db, 'restaurants', restId, 'settings', 'config');
+  const cfgSnap = await getDoc(cfgRef);
+  const dutyTemplates = (cfgSnap.data()?.dutyTemplates || {}) as Record<Shift, any[]>;
+  const duties = Array.isArray(dutyTemplates[shift]) ? dutyTemplates[shift] : [];
+
+  const b2 = writeBatch(db);
+  duties.forEach((d, idx) => {
+    const r = doc(itemsCol);
+    const title = typeof d === 'string' ? d : (d?.title ?? '');
+    const priority = typeof d === 'object' ? !!d?.priority : false;
+    b2.set(r, { title, priority, order: idx, checked: false, expireAt: expiryFor(date) });
+  });
+  await b2.commit();
+};
+
 
   const onToggle = async (item: Item) => {
     if (!me || locked) return;

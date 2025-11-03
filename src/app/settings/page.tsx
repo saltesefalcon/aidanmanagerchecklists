@@ -16,6 +16,7 @@ import {
 import { db } from '@/lib/firebase';
 import Link from 'next/link';
 import { getBusinessDate } from '@/lib/bizdate';
+import { expiryFor } from '@/lib/expiry';
 
 type Shift = 'open' | 'mid' | 'close';
 type Restaurant = { id: string; name: string };
@@ -132,31 +133,36 @@ export default function SettingsPage() {
   };
 
   // Reset a specific date from current template (clears duplicates, applies order/priority)
-  const resetDayFromTemplate = async () => {
-    if (!restId || !resetDate) return;
-    if (!confirm(`Reset ${restId} ${resetDate} ${shift.toUpperCase()} from template? This will DELETE existing items for that shift/date and reseed.`)) return;
+const resetDayFromTemplate = async () => {
+  if (!restId || !resetDate) return;
+  if (!confirm(`Reset ${restId} ${resetDate} ${shift.toUpperCase()} from template? This REPLACES items.`)) return;
 
-    // 1) wipe items
-    const itemsCol = collection(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift, 'items');
-    const snap = await getDocs(itemsCol);
-    const batch = writeBatch(db);
-    snap.forEach((d) => batch.delete(d.ref));
-    await batch.commit();
+  // Ensure day doc exists (optional TTL on day docs if you later add a TTL policy)
+  const dayRef = doc(db, 'restaurants', restId, 'checklists', resetDate);
+  await setDoc(dayRef, { date: resetDate, expireAt: expiryFor(resetDate) }, { merge: true });
 
-    // 2) ensure shift doc unlocked
-    const sref = doc(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift);
-    await setDoc(sref, { locked: false, createdAt: serverTimestamp() }, { merge: true });
+  // Wipe existing items
+  const itemsCol = collection(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift, 'items');
+  const snap = await getDocs(itemsCol);
+  const b1 = writeBatch(db);
+  snap.forEach(d => b1.delete(d.ref));
+  await b1.commit();
 
-    // 3) reseed from current template with order/priority
-    const batch2 = writeBatch(db);
-    templates[shift].forEach((d, idx) => {
-      const r = doc(itemsCol);
-      batch2.set(r, { title: d.title, priority: !!d.priority, order: idx, checked: false });
-    });
-    await batch2.commit();
+  // Recreate shift (unlocked) and stamp expireAt
+  const sref = doc(db, 'restaurants', restId, 'checklists', resetDate, 'shifts', shift);
+  await setDoc(sref, { locked: false, createdAt: serverTimestamp(), expireAt: expiryFor(resetDate) }, { merge: true });
 
-    alert('Checklist reset and reseeded from template.');
-  };
+  // Seed items with order/priority + expireAt
+  const b2 = writeBatch(db);
+  templates[shift].forEach((d, idx) => {
+    const r = doc(itemsCol);
+    b2.set(r, { title: d.title, priority: !!d.priority, order: idx, checked: false, expireAt: expiryFor(resetDate) });
+  });
+  await b2.commit();
+
+  alert('Checklist reseeded from template (with 400-day auto-expiry).');
+};
+
 
   const duties = templates[shift];
 
